@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from typing import Iterator
 
 import numpy as np
+try:
+    from scipy.ndimage import median_filter
+except Exception:  # pragma: no cover - scipy is optional at runtime.
+    median_filter = None
 
 from acs.io.dat_reader import decode_packed_iq
 from acs.io.manifest import ObservationManifest
@@ -28,8 +32,9 @@ class StreamingWaterfallResult:
 def estimate_baseline(sample_frames: np.ndarray, smooth_width: int = 33) -> np.ndarray:
     """Estimate broad per-bin bandpass from sampled frame powers.
 
-    The estimate is intentionally broad-band: median across sampled frames followed by
-    moving-average smoothing across fine-frequency bin index.
+    Parity note:
+    This mirrors the reference `direct_dat_waterfall_qc_v3_optimized.py` semantics:
+    per-bin median in dB over sampled frames, then broad robust smoothing in dB.
     """
 
     if sample_frames.ndim != 2:
@@ -37,17 +42,46 @@ def estimate_baseline(sample_frames: np.ndarray, smooth_width: int = 33) -> np.n
     if sample_frames.shape[0] == 0:
         raise ValueError("sample_frames must contain at least one frame.")
 
-    raw = np.median(sample_frames, axis=0)
     width = int(max(1, smooth_width))
     if width % 2 == 0:
         width += 1
-    if width == 1:
-        return np.maximum(raw, 1e-12)
+    eps = np.float32(1e-12)
 
-    kernel = np.ones(width, dtype=np.float64) / float(width)
-    padded = np.pad(raw.astype(np.float64), (width // 2, width // 2), mode="edge")
-    smooth = np.convolve(padded, kernel, mode="valid")
-    return np.maximum(smooth.astype(np.float32), 1e-12)
+    time_median_db = np.median(10.0 * np.log10(np.maximum(sample_frames, eps)), axis=0).astype(np.float32)
+    if width < 3:
+        baseline_db = time_median_db
+    elif median_filter is not None:
+        baseline_db = median_filter(time_median_db, size=width, mode="nearest").astype(np.float32)
+    else:
+        baseline_db = _robust_bandpass_db_fallback(time_median_db, width_bins=width)
+    baseline_power = np.power(10.0, baseline_db / 10.0).astype(np.float32)
+    return np.maximum(baseline_power, eps)
+
+
+def _robust_bandpass_db_fallback(time_median_db: np.ndarray, width_bins: int) -> np.ndarray:
+    """Numpy-only approximation of the legacy robust dB baseline smoother."""
+
+    if width_bins < 3:
+        return time_median_db.copy()
+    if width_bins % 2 == 0:
+        width_bins += 1
+
+    group = max(5, width_bins // 2)
+    n = len(time_median_db)
+    centers: list[float] = []
+    vals: list[float] = []
+    for s in range(0, n, group):
+        e = min(s + group, n)
+        centers.append((s + e - 1) / 2.0)
+        vals.append(float(np.median(time_median_db[s:e])))
+
+    centers_arr = np.asarray(centers, dtype=np.float64)
+    vals_arr = np.asarray(vals, dtype=np.float64)
+    vals2 = vals_arr.copy()
+    if len(vals_arr) >= 5:
+        for i in range(2, len(vals_arr) - 2):
+            vals2[i] = np.median(vals_arr[i - 2 : i + 3])
+    return np.interp(np.arange(n, dtype=np.float64), centers_arr, vals2).astype(np.float32)
 
 
 def _iter_frame_fine_power(
@@ -95,7 +129,8 @@ def _iter_frame_fine_power(
 def _compute_freq_hz_display(
     *, nfft: int, channels: int, start_freq_hz: float, coarse_channel_spacing_hz: float, sample_rate_hz: float
 ) -> np.ndarray:
-    fine_offsets_hz = np.fft.fftshift(np.fft.fftfreq(nfft, d=1.0 / sample_rate_hz))
+    _ = sample_rate_hz
+    fine_offsets_hz = np.fft.fftshift(np.fft.fftfreq(nfft, d=1.0 / coarse_channel_spacing_hz))
     coarse_centers_hz = start_freq_hz + coarse_channel_spacing_hz * np.arange(channels, dtype=np.float64)
     return (coarse_centers_hz[:, None] + fine_offsets_hz[None, :]).reshape(-1).astype(np.float64)
 
@@ -164,7 +199,8 @@ def build_streaming_waterfall(
 
     decim_buffer: list[np.ndarray] = []
     decim_rows: list[np.ndarray] = []
-    decim_times_rows: list[int] = []
+    decim_start_rows: list[int] = []
+    decim_time_s: list[float] = []
 
     for frame_start_row, fine_power in _iter_frame_fine_power(
         manifest, nfft=nfft, hop=hop, block_rows=block_rows
@@ -176,20 +212,43 @@ def build_streaming_waterfall(
         decim_buffer.append(excess)
         if len(decim_buffer) == time_decimation:
             decim_rows.append(np.mean(np.stack(decim_buffer, axis=0), axis=0))
-            decim_times_rows.append(frame_start_row - (time_decimation - 1) * hop)
+            first_row = frame_start_row - (time_decimation - 1) * hop
+            decim_start_rows.append(int(first_row))
+            group_starts = first_row + hop * np.arange(time_decimation, dtype=np.float64)
+            center_rows = group_starts + (nfft / 2.0)
+            decim_time_s.append(float(np.mean(center_rows) / sample_rate_hz))
             decim_buffer.clear()
 
     if decim_buffer:
         decim_rows.append(np.mean(np.stack(decim_buffer, axis=0), axis=0))
-        decim_times_rows.append(last_start_row - (len(decim_buffer) - 1) * hop)
+        first_row = last_start_row - (len(decim_buffer) - 1) * hop
+        decim_start_rows.append(int(first_row))
+        group_starts = first_row + hop * np.arange(len(decim_buffer), dtype=np.float64)
+        center_rows = group_starts + (nfft / 2.0)
+        decim_time_s.append(float(np.mean(center_rows) / sample_rate_hz))
 
     mean_excess = (sum_excess / float(frame_count)).astype(np.float32)
     waterfall = np.stack(decim_rows, axis=0).astype(np.float32)
+    mean_excess_db_full = (10.0 * np.log10(np.maximum(mean_excess, 1e-12))).astype(np.float32)
+    waterfall_db_full = (10.0 * np.log10(np.maximum(waterfall, 1e-12))).astype(np.float32)
 
     if freq_decimation > 1:
         usable_bins = (fine_bins // freq_decimation) * freq_decimation
-        waterfall = waterfall[:, :usable_bins].reshape(waterfall.shape[0], -1, freq_decimation).mean(axis=2)
-        mean_excess = mean_excess[:usable_bins].reshape(-1, freq_decimation).mean(axis=1)
+        waterfall_db = (
+            waterfall_db_full[:, :usable_bins]
+            .reshape(waterfall_db_full.shape[0], -1, freq_decimation)
+            .mean(axis=2)
+            .astype(np.float32)
+        )
+        mean_excess_db = (
+            mean_excess_db_full[:usable_bins]
+            .reshape(-1, freq_decimation)
+            .mean(axis=1)
+            .astype(np.float32)
+        )
+    else:
+        waterfall_db = waterfall_db_full
+        mean_excess_db = mean_excess_db_full
 
     freq_hz = _compute_freq_hz_display(
         nfft=nfft,
@@ -204,10 +263,7 @@ def build_streaming_waterfall(
     else:
         freq_hz_display = freq_hz
 
-    time_s_display = (np.asarray(decim_times_rows, dtype=np.float64) / float(sample_rate_hz)).astype(np.float64)
-
-    waterfall_db = (10.0 * np.log10(np.maximum(waterfall, 1e-12))).astype(np.float32)
-    mean_excess_db = (10.0 * np.log10(np.maximum(mean_excess, 1e-12))).astype(np.float32)
+    time_s_display = np.asarray(decim_time_s, dtype=np.float64)
 
     metadata: dict[str, int | float | str] = {
         "nfft": int(nfft),
@@ -222,17 +278,23 @@ def build_streaming_waterfall(
         "freq_decimation": int(freq_decimation),
         "fine_bins_total": int(fine_bins),
         "display_freq_bins": int(waterfall_db.shape[1]),
+        "display_time_start_s": float(time_s_display[0]),
+        "display_time_end_s": float(time_s_display[-1]),
+        "display_freq_start_hz": float(freq_hz_display[0]),
+        "display_freq_end_hz": float(freq_hz_display[-1]),
         "sample_rate_hz": float(sample_rate_hz),
         "start_freq_hz": float(start_freq_hz),
         "coarse_channel_spacing_hz": float(coarse_channel_spacing_hz),
-        "fine_bin_spacing_hz": float(sample_rate_hz / nfft),
+        "fine_bin_spacing_hz": float(coarse_channel_spacing_hz / nfft),
+        "frame_time_origin": "stft_window_center",
+        "display_decimation_domain": "dB",
     }
 
     return StreamingWaterfallResult(
         waterfall_db=waterfall_db,
         mean_excess_db=mean_excess_db,
         baseline_power=baseline.astype(np.float32),
-        display_frame_start_rows=np.asarray(decim_times_rows, dtype=np.int64),
+        display_frame_start_rows=np.asarray(decim_start_rows, dtype=np.int64),
         freq_hz_display=freq_hz_display,
         time_s_display=time_s_display,
         metadata=metadata,

@@ -78,7 +78,8 @@ def test_build_streaming_waterfall_matches_reference_across_file_boundary(tmp_pa
     assert result.waterfall_db.shape[1] == ROW_WIDTH * 8
     assert result.metadata["fine_bins_total"] == ROW_WIDTH * 8
     np.testing.assert_array_equal(result.display_frame_start_rows, np.array([0, 8, 16], dtype=np.int64))
-    np.testing.assert_allclose(result.time_s_display, np.array([0.0, 1.0, 2.0]))
+    np.testing.assert_allclose(result.time_s_display, np.array([0.75, 1.75, 2.75]))
+    assert result.metadata["fine_bin_spacing_hz"] == 0.25
 
 
 def test_build_streaming_waterfall_rejects_observation_shorter_than_frame(tmp_path):
@@ -123,3 +124,51 @@ def test_build_streaming_waterfall_retains_fine_bins_without_freq_decimation(tmp
 
     assert result.mean_excess_db.shape == (ROW_WIDTH * 8,)
     assert result.waterfall_db.shape[1] == ROW_WIDTH * 8
+
+
+def test_build_streaming_waterfall_freq_decimation_applies_in_db_domain(tmp_path):
+    rows_total = 32
+    i_vals = np.zeros((rows_total, ROW_WIDTH), dtype=np.int16)
+    q_vals = np.zeros((rows_total, ROW_WIDTH), dtype=np.int16)
+    i_vals[:, 5] = 8
+    i_vals[:, 6] = 12
+    words = _pack_iq(i_vals, q_vals)
+
+    dat = tmp_path / "obs.dat"
+    _write_dat(dat, words)
+    manifest = ObservationManifest(files=(DatFileEntry(dat_path=dat),))
+
+    full = build_streaming_waterfall(
+        manifest,
+        nfft=8,
+        hop=4,
+        block_rows=10,
+        baseline_sample_frames=2,
+        baseline_smooth_width=1,
+        time_decimation=2,
+        freq_decimation=1,
+        sample_rate_hz=16.0,
+        start_freq_hz=1.0e9,
+        coarse_channel_spacing_hz=4.0,
+    )
+    decimated = build_streaming_waterfall(
+        manifest,
+        nfft=8,
+        hop=4,
+        block_rows=10,
+        baseline_sample_frames=2,
+        baseline_smooth_width=1,
+        time_decimation=2,
+        freq_decimation=2,
+        sample_rate_hz=16.0,
+        start_freq_hz=1.0e9,
+        coarse_channel_spacing_hz=4.0,
+    )
+
+    expected_mean_db = full.mean_excess_db.reshape(-1, 2).mean(axis=1)
+    expected_waterfall_db = full.waterfall_db.reshape(full.waterfall_db.shape[0], -1, 2).mean(axis=2)
+    expected_freq = full.freq_hz_display.reshape(-1, 2).mean(axis=1)
+
+    np.testing.assert_allclose(decimated.mean_excess_db, expected_mean_db, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(decimated.waterfall_db, expected_waterfall_db, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(decimated.freq_hz_display, expected_freq, rtol=0.0, atol=1e-9)
