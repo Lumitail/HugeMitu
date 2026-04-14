@@ -26,23 +26,34 @@ The implementation preserves the existing raw `.dat` contract:
 3. Maintain a carry-buffer of trailing samples so STFT frames crossing block boundaries are
    complete and continuous.
 4. Emit non-overlapping global STFT frame starts using `hop` stepping (no double counting).
-5. Capture only up to `baseline_sample_frames` coarse-power vectors for baseline estimation.
+5. Capture only up to `baseline_sample_frames` **fine-frequency** power vectors for baseline
+   estimation.
 
 Baseline estimation:
 
-- median across sampled frames per coarse channel
-- broad smoothing with moving average across channels (`baseline_smooth_width`)
-
-This produces a broad bandpass estimate appropriate for first-pass H I-adjacent QC flattening.
+- median across sampled frames per fine-frequency bin
+- broad smoothing with moving average across fine-frequency index (`baseline_smooth_width`)
 
 ### Pass 2: flattened products
 
-1. Re-stream frame coarse-power vectors.
+1. Re-stream frame fine-frequency power vectors (`256 * nfft` bins per frame).
 2. Divide by baseline to produce excess power.
-3. Accumulate mean-excess spectrum incrementally.
+3. Accumulate mean-excess spectrum incrementally in fine-frequency representation.
 4. Produce display waterfall by temporal decimation (`time_decimation`) using group means.
+5. Optionally apply frequency decimation (`freq_decimation`) **after** flattening.
 
 Outputs are converted to dB for review visualization.
+
+## Physical display coordinates
+
+QC outputs include physically meaningful axes:
+
+- `freq_hz_display`: flattened fine-frequency axis in Hz (per coarse channel center plus FFT
+  bin offsets)
+- `time_s_display`: display frame start times in seconds (`display_frame_start_rows / sample_rate_hz`)
+
+The review plots use these arrays directly, so X/Y are physical frequency/time instead of
+coarse-channel and frame-index units.
 
 ## Memory model
 
@@ -50,9 +61,8 @@ The pipeline keeps memory bounded by:
 
 - one streamed block of decoded rows
 - one carry-buffer tail (at most `nfft - 1` rows plus short remainder)
-- bounded baseline sample bank (`baseline_sample_frames x 256`)
-- decimated display waterfall (`display_frames x 256`), where `display_frames` is reduced by
-  `time_decimation`
+- bounded baseline sample bank (`baseline_sample_frames x (256 * nfft)`)
+- decimated display waterfall (`display_frames x display_freq_bins`)
 - small running accumulators (mean spectrum sums and metadata)
 
 It does **not** allocate:
@@ -68,5 +78,5 @@ It does **not** allocate:
 - mean-excess spectrum PNG
 - metadata summary JSON
 
-The JSON includes STFT parameters, frame counts, display frame row coordinates, and basic
-baseline statistics.
+The JSON includes STFT parameters, display shape, physical axis arrays, frame row/time
+coordinates, and baseline statistics.

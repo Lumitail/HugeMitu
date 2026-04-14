@@ -20,6 +20,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--baseline-sample-frames", type=int, default=128)
     parser.add_argument("--baseline-smooth-width", type=int, default=33)
     parser.add_argument("--time-decimation", type=int, default=4)
+    parser.add_argument("--freq-decimation", type=int, default=1)
+    parser.add_argument("--sample-rate-hz", type=float, default=1.0)
+    parser.add_argument("--start-freq-hz", type=float, default=0.0)
+    parser.add_argument("--coarse-channel-spacing-hz", type=float, default=1.0)
     parser.add_argument("--stem", type=str, default="qc")
     return parser
 
@@ -37,6 +41,10 @@ def main(argv: list[str] | None = None) -> int:
         baseline_sample_frames=args.baseline_sample_frames,
         baseline_smooth_width=args.baseline_smooth_width,
         time_decimation=args.time_decimation,
+        freq_decimation=args.freq_decimation,
+        sample_rate_hz=args.sample_rate_hz,
+        start_freq_hz=args.start_freq_hz,
+        coarse_channel_spacing_hz=args.coarse_channel_spacing_hz,
     )
     paths = save_qc_review_bundle(result, args.output_dir, stem=args.stem)
 
