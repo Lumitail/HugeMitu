@@ -36,18 +36,24 @@ def save_qc_review_bundle(
         origin="lower",
         interpolation="nearest",
         cmap="viridis",
+        extent=[
+            float(result.freq_hz_display[0]),
+            float(result.freq_hz_display[-1]),
+            float(result.time_s_display[0]),
+            float(result.time_s_display[-1]),
+        ],
     )
-    ax.set_title("Baseline-flattened display waterfall (dB)")
-    ax.set_xlabel("Coarse channel index")
-    ax.set_ylabel("Decimated STFT frame")
+    ax.set_title("Baseline-flattened fine-frequency waterfall (dB)")
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Time (s)")
     fig.colorbar(im, ax=ax, label="dB")
     fig.savefig(waterfall_path, dpi=150)
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(10, 4), constrained_layout=True)
-    ax.plot(np.arange(result.mean_excess_db.shape[0]), result.mean_excess_db, linewidth=1.0)
+    ax.plot(result.freq_hz_display, result.mean_excess_db, linewidth=1.0)
     ax.set_title("Mean excess spectrum (dB)")
-    ax.set_xlabel("Coarse channel index")
+    ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("dB")
     ax.grid(True, alpha=0.2)
     fig.savefig(spectrum_path, dpi=150)
@@ -57,6 +63,8 @@ def save_qc_review_bundle(
     metadata_payload["waterfall_shape"] = list(result.waterfall_db.shape)
     metadata_payload["mean_excess_shape"] = list(result.mean_excess_db.shape)
     metadata_payload["display_frame_start_rows"] = result.display_frame_start_rows.tolist()
+    metadata_payload["time_s_display"] = result.time_s_display.tolist()
+    metadata_payload["freq_hz_display"] = result.freq_hz_display.tolist()
     metadata_payload["baseline_power_min"] = float(np.min(result.baseline_power))
     metadata_payload["baseline_power_max"] = float(np.max(result.baseline_power))
     metadata_path.write_text(json.dumps(metadata_payload, indent=2, sort_keys=True))

@@ -30,6 +30,9 @@ def test_save_qc_review_bundle_writes_expected_artifacts(tmp_path):
         block_rows=9,
         baseline_sample_frames=2,
         time_decimation=2,
+        sample_rate_hz=100.0,
+        start_freq_hz=1.42e9,
+        coarse_channel_spacing_hz=10_000.0,
     )
 
     outputs = save_qc_review_bundle(result, tmp_path / "qc_out", stem="review")
@@ -43,3 +46,7 @@ def test_save_qc_review_bundle_writes_expected_artifacts(tmp_path):
     assert metadata["hop"] == 4
     assert metadata["display_frames"] == result.waterfall_db.shape[0]
     assert len(metadata["display_frame_start_rows"]) == result.waterfall_db.shape[0]
+    assert metadata["waterfall_shape"][1] == 256 * 8
+    assert metadata["mean_excess_shape"][0] == 256 * 8
+    assert len(metadata["freq_hz_display"]) == 256 * 8
+    assert len(metadata["time_s_display"]) == result.waterfall_db.shape[0]

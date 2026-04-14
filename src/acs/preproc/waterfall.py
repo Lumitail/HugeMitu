@@ -20,18 +20,20 @@ class StreamingWaterfallResult:
     mean_excess_db: np.ndarray
     baseline_power: np.ndarray
     display_frame_start_rows: np.ndarray
+    freq_hz_display: np.ndarray
+    time_s_display: np.ndarray
     metadata: dict[str, int | float | str]
 
 
 def estimate_baseline(sample_frames: np.ndarray, smooth_width: int = 33) -> np.ndarray:
-    """Estimate broad per-channel bandpass from sampled frame powers.
+    """Estimate broad per-bin bandpass from sampled frame powers.
 
     The estimate is intentionally broad-band: median across sampled frames followed by
-    moving-average smoothing across coarse-channel index.
+    moving-average smoothing across fine-frequency bin index.
     """
 
     if sample_frames.ndim != 2:
-        raise ValueError("sample_frames must have shape (n_frames, n_channels).")
+        raise ValueError("sample_frames must have shape (n_frames, n_bins).")
     if sample_frames.shape[0] == 0:
         raise ValueError("sample_frames must contain at least one frame.")
 
@@ -48,14 +50,14 @@ def estimate_baseline(sample_frames: np.ndarray, smooth_width: int = 33) -> np.n
     return np.maximum(smooth.astype(np.float32), 1e-12)
 
 
-def _iter_frame_coarse_power(
+def _iter_frame_fine_power(
     manifest: ObservationManifest,
     *,
     nfft: int,
     hop: int,
     block_rows: int,
 ) -> Iterator[tuple[int, np.ndarray]]:
-    """Yield (global_frame_start_row, coarse_power[256]) for the observation."""
+    """Yield (global_frame_start_row, fine_power[256*nfft]) for the observation."""
 
     if nfft <= 0:
         raise ValueError("nfft must be > 0")
@@ -78,9 +80,9 @@ def _iter_frame_coarse_power(
         while frame_start + nfft <= combined.shape[0]:
             frame = combined[frame_start : frame_start + nfft, :]
             fft_out = np.fft.fft(frame, axis=0)
-            power = np.abs(fft_out) ** 2
-            coarse_power = power.mean(axis=0).astype(np.float32)
-            yield combined_start + frame_start, coarse_power
+            power = np.abs(np.fft.fftshift(fft_out, axes=0)) ** 2
+            fine_power = power.T.reshape(-1).astype(np.float32)
+            yield combined_start + frame_start, fine_power
             frame_start += hop
 
         if combined.shape[0] >= nfft:
@@ -88,6 +90,14 @@ def _iter_frame_coarse_power(
         else:
             carry_start = 0
         carry = np.array(combined[carry_start:], copy=True)
+
+
+def _compute_freq_hz_display(
+    *, nfft: int, channels: int, start_freq_hz: float, coarse_channel_spacing_hz: float, sample_rate_hz: float
+) -> np.ndarray:
+    fine_offsets_hz = np.fft.fftshift(np.fft.fftfreq(nfft, d=1.0 / sample_rate_hz))
+    coarse_centers_hz = start_freq_hz + coarse_channel_spacing_hz * np.arange(channels, dtype=np.float64)
+    return (coarse_centers_hz[:, None] + fine_offsets_hz[None, :]).reshape(-1).astype(np.float64)
 
 
 def build_streaming_waterfall(
@@ -100,12 +110,16 @@ def build_streaming_waterfall(
     baseline_sample_frames: int = 128,
     baseline_smooth_width: int = 33,
     time_decimation: int = 4,
+    freq_decimation: int = 1,
+    sample_rate_hz: float = 1.0,
+    start_freq_hz: float = 0.0,
+    coarse_channel_spacing_hz: float = 1.0,
 ) -> StreamingWaterfallResult:
     """Build streaming two-pass waterfall/QC products for one observation.
 
-    Pass 1 samples a bounded number of coarse-power STFT frames for baseline
-    estimation and captures global frame coordinates. Pass 2 computes baseline-flattened
-    waterfall/spectrum products without materializing full-resolution cubes.
+    Pass 1 samples a bounded number of fine-power STFT frames for baseline estimation.
+    Pass 2 computes baseline-flattened fine-frequency waterfall/spectrum products and then
+    optionally decimates for display.
     """
 
     if overlap_rows != 0:
@@ -116,13 +130,17 @@ def build_streaming_waterfall(
         raise ValueError("baseline_sample_frames must be > 0")
     if time_decimation <= 0:
         raise ValueError("time_decimation must be > 0")
+    if freq_decimation <= 0:
+        raise ValueError("freq_decimation must be > 0")
+    if sample_rate_hz <= 0:
+        raise ValueError("sample_rate_hz must be > 0")
 
     sampled: list[np.ndarray] = []
     total_frames = 0
     first_start_row: int | None = None
     last_start_row: int | None = None
 
-    for frame_start_row, coarse_power in _iter_frame_coarse_power(
+    for frame_start_row, fine_power in _iter_frame_fine_power(
         manifest, nfft=nfft, hop=hop, block_rows=block_rows
     ):
         if first_start_row is None:
@@ -130,7 +148,7 @@ def build_streaming_waterfall(
         last_start_row = frame_start_row
         total_frames += 1
         if len(sampled) < baseline_sample_frames:
-            sampled.append(coarse_power)
+            sampled.append(fine_power)
 
     if total_frames == 0:
         raise ValueError(
@@ -140,31 +158,53 @@ def build_streaming_waterfall(
     sample_array = np.stack(sampled, axis=0)
     baseline = estimate_baseline(sample_array, smooth_width=baseline_smooth_width)
 
-    decim_buffer: list[np.ndarray] = []
-    decim_rows: list[np.ndarray] = []
-    decim_times: list[int] = []
-    sum_excess = np.zeros(256, dtype=np.float64)
+    fine_bins = 256 * nfft
+    sum_excess = np.zeros(fine_bins, dtype=np.float64)
     frame_count = 0
 
-    for frame_start_row, coarse_power in _iter_frame_coarse_power(
+    decim_buffer: list[np.ndarray] = []
+    decim_rows: list[np.ndarray] = []
+    decim_times_rows: list[int] = []
+
+    for frame_start_row, fine_power in _iter_frame_fine_power(
         manifest, nfft=nfft, hop=hop, block_rows=block_rows
     ):
-        excess = coarse_power / baseline
+        excess = fine_power / baseline
         sum_excess += excess
         frame_count += 1
 
         decim_buffer.append(excess)
         if len(decim_buffer) == time_decimation:
             decim_rows.append(np.mean(np.stack(decim_buffer, axis=0), axis=0))
-            decim_times.append(frame_start_row - (time_decimation - 1) * hop)
+            decim_times_rows.append(frame_start_row - (time_decimation - 1) * hop)
             decim_buffer.clear()
 
     if decim_buffer:
         decim_rows.append(np.mean(np.stack(decim_buffer, axis=0), axis=0))
-        decim_times.append(last_start_row - (len(decim_buffer) - 1) * hop)
+        decim_times_rows.append(last_start_row - (len(decim_buffer) - 1) * hop)
 
     mean_excess = (sum_excess / float(frame_count)).astype(np.float32)
     waterfall = np.stack(decim_rows, axis=0).astype(np.float32)
+
+    if freq_decimation > 1:
+        usable_bins = (fine_bins // freq_decimation) * freq_decimation
+        waterfall = waterfall[:, :usable_bins].reshape(waterfall.shape[0], -1, freq_decimation).mean(axis=2)
+        mean_excess = mean_excess[:usable_bins].reshape(-1, freq_decimation).mean(axis=1)
+
+    freq_hz = _compute_freq_hz_display(
+        nfft=nfft,
+        channels=256,
+        start_freq_hz=float(start_freq_hz),
+        coarse_channel_spacing_hz=float(coarse_channel_spacing_hz),
+        sample_rate_hz=float(sample_rate_hz),
+    )
+    if freq_decimation > 1:
+        usable_bins = (freq_hz.shape[0] // freq_decimation) * freq_decimation
+        freq_hz_display = freq_hz[:usable_bins].reshape(-1, freq_decimation).mean(axis=1)
+    else:
+        freq_hz_display = freq_hz
+
+    time_s_display = (np.asarray(decim_times_rows, dtype=np.float64) / float(sample_rate_hz)).astype(np.float64)
 
     waterfall_db = (10.0 * np.log10(np.maximum(waterfall, 1e-12))).astype(np.float32)
     mean_excess_db = (10.0 * np.log10(np.maximum(mean_excess, 1e-12))).astype(np.float32)
@@ -179,12 +219,21 @@ def build_streaming_waterfall(
         "first_frame_start_row": int(first_start_row),
         "last_frame_start_row": int(last_start_row),
         "time_decimation": int(time_decimation),
+        "freq_decimation": int(freq_decimation),
+        "fine_bins_total": int(fine_bins),
+        "display_freq_bins": int(waterfall_db.shape[1]),
+        "sample_rate_hz": float(sample_rate_hz),
+        "start_freq_hz": float(start_freq_hz),
+        "coarse_channel_spacing_hz": float(coarse_channel_spacing_hz),
+        "fine_bin_spacing_hz": float(sample_rate_hz / nfft),
     }
 
     return StreamingWaterfallResult(
         waterfall_db=waterfall_db,
         mean_excess_db=mean_excess_db,
         baseline_power=baseline.astype(np.float32),
-        display_frame_start_rows=np.asarray(decim_times, dtype=np.int64),
+        display_frame_start_rows=np.asarray(decim_times_rows, dtype=np.int64),
+        freq_hz_display=freq_hz_display,
+        time_s_display=time_s_display,
         metadata=metadata,
     )
